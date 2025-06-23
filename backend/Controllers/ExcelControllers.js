@@ -1,13 +1,10 @@
-const XLSX = require('xlsx');
-const path = require('path');
-const fs = require('fs/promises');
-const File = require('../Models/File');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const XLSX = require('xlsx'); // For reading Excel files
+const path = require('path'); // For file path utilities
+const fs = require('fs/promises'); // For async file operations
+const File = require('../Models/File'); // Mongoose model for uploaded files
+const { GoogleGenerativeAI } = require('@google/generative-ai'); // Gemini AI SDK
 
-// Load environment variables at the very top of your application's entry point (server.js)
-// require('dotenv').config() should already be in server.js. No need to duplicate here.
-
-// Initialize Gemini with proper error handling and correct model configuration
+// Initialize Gemini AI with API key from environment variables
 let genAI;
 try {
   if (!process.env.GEMINI_API_KEY) {
@@ -20,18 +17,17 @@ try {
   console.error('Failed to initialize Gemini AI:', error);
 }
 
-// Rate limiting setup for AI calls
+// Rate limiting for AI requests (to prevent abuse)
 const aiRequestCounts = new Map();
-const AI_RATE_LIMIT = 5; // e.g., 5 AI requests per minute per user
-const AI_RATE_WINDOW = 60000; // 1 minute in milliseconds
+const AI_RATE_LIMIT = 5; // Max 5 AI requests per minute per user
+const AI_RATE_WINDOW = 60000; // 1 minute in ms
 
-// Middleware for AI rate limiting
+// Middleware to enforce AI rate limiting per user
 const aiRateLimiter = (req, res, next) => {
-    const userId = req.user.id; // Assuming req.user.id is available from auth middleware
+    const userId = req.user.id; // Assumes req.user.id is set by auth middleware
     const now = Date.now();
     const requests = aiRequestCounts.get(userId) || [];
-
-    // Filter out old requests outside the window
+    // Remove requests outside the time window
     const recentRequests = requests.filter(timestamp => now - timestamp < AI_RATE_WINDOW);
 
     if (recentRequests.length >= AI_RATE_LIMIT) {
@@ -43,39 +39,37 @@ const aiRateLimiter = (req, res, next) => {
     next();
 };
 
+// Handle Excel file uploads
 const uploadExcel = async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ message: 'Please upload a file' });
         }
 
-        // Validate file size
-        if (req.file.size > 5 * 1024 * 1024) { // 5MB
-            await fs.unlink(req.file.path);
+        // Reject files over 5MB
+        if (req.file.size > 5 * 1024 * 1024) {
+            await fs.unlink(req.file.path); // Delete the file
             return res.status(400).json({ message: 'File size should be less than 5MB' });
         }
 
-        // Validate file type
+        // Only allow Excel files
         const validMimeTypes = [
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // .xlsx
-            'application/vnd.ms-excel', // .xls
-            'application/octet-stream' // Sometimes generic for Excel files
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'application/vnd.ms-excel',
+            'application/octet-stream'
         ];
-
         if (!validMimeTypes.includes(req.file.mimetype)) {
             await fs.unlink(req.file.path);
             return res.status(400).json({ message: 'Only Excel files are allowed' });
         }
 
-        // Create new file document in MongoDB
+        // Save file info to MongoDB
         const file = new File({
             filename: req.file.filename,
             originalName: req.file.originalname,
-            user: req.user.id, // This comes from the auth middleware
+            user: req.user.id,
             size: req.file.size
         });
-
-        // Save file info to MongoDB
         await file.save();
 
         res.status(200).json({
@@ -88,22 +82,22 @@ const uploadExcel = async (req, res) => {
     }
 };
 
+// List all files uploaded by the current user
 const getFiles = async (req, res) => {
     try {
         const files = await File.find({ user: req.user.id })
             .sort({ uploadedAt: -1 });
-
         res.json({ files });
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
 };
 
-// Update analyze endpoint to also calculate basic statistics
+// Analyze an uploaded Excel file and return data + stats
 const analyzeExcel = async (req, res) => {
     try {
         const { filename } = req.body;
-
+        // Find the file in DB and ensure it belongs to the user
         const file = await File.findOne({
             filename,
             user: req.user.id
@@ -116,12 +110,13 @@ const analyzeExcel = async (req, res) => {
         const filePath = path.join(__dirname, '../uploads', filename);
 
         try {
+            // Read Excel file
             const workbook = XLSX.readFile(filePath);
             const sheetName = workbook.SheetNames[0];
             const worksheet = workbook.Sheets[sheetName];
             const data = XLSX.utils.sheet_to_json(worksheet);
 
-            // Calculate basic statistics for numeric columns
+            // Get columns and calculate statistics for numeric columns
             const columns = Object.keys(data.length > 0 ? data[0] : {});
             const statistics = [];
 
@@ -142,6 +137,7 @@ const analyzeExcel = async (req, res) => {
                 }
             });
 
+            // Return parsed data, columns, and statistics to frontend
             res.json({
                 data: data,
                 columns: columns,
@@ -161,12 +157,13 @@ const analyzeExcel = async (req, res) => {
     }
 };
 
+// Get user file and chart stats for dashboard
 const getStats = async (req, res) => {
     try {
         const files = await File.find({ user: req.user.id });
-
         const totalSize = files.reduce((acc, file) => acc + file.size, 0);
 
+        // Aggregate chart usage across all user's files
         const chartStats = await File.aggregate([
             { $match: { user: req.user.id } },
             { $unwind: '$analyses' },
@@ -179,6 +176,7 @@ const getStats = async (req, res) => {
             { $sort: { count: -1 } }
         ]);
 
+        // Get 5 most recent files and activities
         const recentActivity = await File.find({ user: req.user.id })
             .sort({ uploadedAt: -1 })
             .limit(5)
@@ -205,28 +203,28 @@ const getStats = async (req, res) => {
     }
 };
 
+// Generate AI-powered business insights from Excel data
 const generateInsights = async (req, res) => {
     try {
-        // Initial validation for AI service availability
+        // Check if Gemini AI is initialized
         if (!genAI) {
             return res.status(500).json({
                 message: 'AI service not available. Please check server configuration and GEMINI_API_KEY.'
             });
         }
 
-        // Apply AI specific rate limiting
-        aiRateLimiter(req, res, async () => { // Use async to allow next() to be awaited within the try block
+        // Apply AI-specific rate limiting
+        aiRateLimiter(req, res, async () => {
             const { columns, rowCount, sampleData, statistics } = req.body;
 
-            // Validate input data
+            // Validate input
             if (!columns?.length || !sampleData?.length || !statistics?.length) {
                 return res.status(400).json({
                     message: 'Invalid or missing data for AI analysis. Please provide columns, sample data, and statistics.'
                 });
             }
 
-            // Construct the prompt for Gemini
-            // Emphasize the desired structured output
+            // Build prompt for Gemini AI (asks for bullet points, trends, best/worst regions, etc.)
             const prompt = `Analyze the provided Excel dataset summary and generate comprehensive business insights.
             
 **Dataset Overview:**
@@ -279,8 +277,6 @@ Ensure your insights are concise, relevant, and directly actionable where possib
 
             try {
                 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-                // Generate content
                 const result = await model.generateContent(prompt);
 
                 if (!result?.response) {
@@ -288,19 +284,18 @@ Ensure your insights are concise, relevant, and directly actionable where possib
                 }
 
                 const aiResponse = result.response.text();
-                const insights = parseAIResponse(aiResponse); // Use the robust parser
+                const insights = parseAIResponse(aiResponse);
 
                 res.json({ insights });
 
             } catch (aiError) {
                 console.error('AI Generation Error:', aiError);
-                // Check for specific Gemini API errors (e.g., content safety, quota)
                 let errorMessage = 'Failed to generate AI insights';
                 if (aiError.response && aiError.response.data && aiError.response.data.error) {
                     errorMessage = aiError.response.data.error.message || errorMessage;
-                } else if (aiError.message.includes('blocked')) { // Example: Content safety filter
+                } else if (aiError.message.includes('blocked')) {
                     errorMessage = 'AI insights blocked due to content policy. Please try a different prompt.';
-                } else if (aiError.message.includes('quota')) { // Example: Quota exceeded
+                } else if (aiError.message.includes('quota')) {
                     errorMessage = 'AI service quota exceeded. Please try again later.';
                 }
 
@@ -309,7 +304,7 @@ Ensure your insights are concise, relevant, and directly actionable where possib
                     error: aiError.message
                 });
             }
-        }); // End of aiRateLimiter callback
+        });
     } catch (error) {
         console.error('Generate Insights Request Error:', error);
         res.status(500).json({
@@ -319,7 +314,7 @@ Ensure your insights are concise, relevant, and directly actionable where possib
     }
 };
 
-// Helper function to parse AI response with a more structured approach
+// Helper: Parse AI response into structured sections
 const parseAIResponse = (aiText) => {
     if (!aiText) {
         return [{
@@ -331,16 +326,15 @@ const parseAIResponse = (aiText) => {
     }
 
     const insights = [];
-    // Use regex to split by bold headings (e.g., **1. Key Trends and Patterns:**)
+    // Split by bold headings (e.g., **1. Key Trends and Patterns:**)
     const sections = aiText.split(/\*\*(\d+\.\s*[^:]+):\*\*\s*\n/);
 
-    // The first element might be empty or preamble before the first section
     if (sections.length > 1 && sections[0].trim() === '') {
-        sections.shift(); // Remove the empty first element if it exists
+        sections.shift();
     }
 
     for (let i = 0; i < sections.length; i += 2) {
-        const titleRaw = sections[i] ? sections[i].trim() : ''; // Get the raw title part
+        const titleRaw = sections[i] ? sections[i].trim() : '';
         const content = sections[i + 1] ? sections[i + 1].trim() : '';
 
         if (!titleRaw || !content) continue;
@@ -358,39 +352,35 @@ const parseAIResponse = (aiText) => {
             type = 'recommendation';
         }
 
-        // Clean up the title (remove leading numbers, etc.)
         const title = titleRaw.replace(/^\d+\.\s*/, '').trim();
 
         insights.push({
             type,
             title,
             description: content,
-            recommendation: extractRecommendation(content) // Still try to extract if present
+            recommendation: extractRecommendation(content)
         });
     }
 
-    // Fallback if structured parsing fails
     if (insights.length === 0 && aiText.trim()) {
         insights.push({
             type: 'raw_insight',
             title: 'AI Insights',
             description: aiText.trim(),
-            recommendation: '' // No specific recommendation extracted
+            recommendation: ''
         });
     }
 
     return insights;
 };
 
-// This function still works for individual recommendations within a description
+// Helper: Extract recommendations from text
 const extractRecommendation = (text) => {
     const recommendationMatch = text.match(/recommend(?:ation)?s?:?\s*([^\.]+)/i);
-    // This looks for "recommendation(s):" followed by text up to the first period.
-    // It's a heuristic and might need refinement based on actual AI output patterns.
     return recommendationMatch ? recommendationMatch[1].trim() : '';
 };
 
-// Helper function to calculate correlation coefficient (keep if you plan to use it locally)
+// Helper: Calculate correlation (not used directly in this file)
 const calculateCorrelation = (x, y) => {
     const n = x.length;
     if (n === 0) return 0;
@@ -416,5 +406,5 @@ module.exports = {
     analyzeExcel,
     getStats,
     generateInsights,
-    aiRateLimiter // Export the middleware to use in ExcelRoutes
+    aiRateLimiter // Export rate limiter middleware for routes
 };

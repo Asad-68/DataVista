@@ -36,7 +36,7 @@ const ExportOptions = ({ data, selectedColumns, chartRef }) => {
       });
 
       const pageWidth = doc.internal.pageSize.width;
-      let yOffset = 40;
+      let yOffset = 20;
 
       // Add title
       doc.setFontSize(16);
@@ -84,7 +84,8 @@ const ExportOptions = ({ data, selectedColumns, chartRef }) => {
             margin: { top: 30 }
           });
 
-          yOffset = doc.previousAutoTable.finalY + 20;
+          yOffset = doc.lastAutoTable.finalY + 20;
+
         } catch (error) {
           console.error('Table export failed:', error);
         }
